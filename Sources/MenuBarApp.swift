@@ -9,7 +9,7 @@ let appVersion = "0.2"
 let githubRepo = "mbinde/NotifyMeHow"
 
 /// Menu bar application for NotifyMeHow
-class MenuBarApp: NSObject, NSApplicationDelegate {
+class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var statusMenu: NSMenu!
     private var monitor: NotificationMonitor?
@@ -40,6 +40,7 @@ class MenuBarApp: NSObject, NSApplicationDelegate {
         }
 
         // Assign menu to status item
+        statusMenu.delegate = self
         statusItem.menu = statusMenu
 
         // Listen for settings changes
@@ -122,7 +123,7 @@ class MenuBarApp: NSObject, NSApplicationDelegate {
 
         // Start/Stop at the top
         let isRunning = monitor != nil
-        let hasPerms = isRunning || hasAccessibilityPermissions()
+        let hasPerms = hasAccessibilityPermissions()
         let toggleTitle = isRunning ? "Stop Monitoring" : "Start Monitoring"
         let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleMonitoring(_:)), keyEquivalent: "")
         toggleItem.target = self
@@ -132,6 +133,13 @@ class MenuBarApp: NSObject, NSApplicationDelegate {
             toggleItem.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: nil)
         }
         statusMenu.addItem(toggleItem)
+
+        // Monitoring can be enabled but not attached - say so rather than silently doing nothing
+        if isRunning && hasPerms && monitor?.isActive != true {
+            let stalledItem = NSMenuItem(title: "Reconnecting to Notification Center...", action: nil, keyEquivalent: "")
+            stalledItem.isEnabled = false
+            statusMenu.addItem(stalledItem)
+        }
 
         // Version info
         let versionItem = NSMenuItem(title: "NotifyMeHow v\(appVersion)", action: nil, keyEquivalent: "")
@@ -202,6 +210,10 @@ class MenuBarApp: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "Quit NotifyMeHow", action: #selector(quitApp(_:)), keyEquivalent: "q")
         quitItem.target = self
         statusMenu.addItem(quitItem)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
     }
 
     @objc func settingsDidChange() {

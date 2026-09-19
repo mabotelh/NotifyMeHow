@@ -41,7 +41,7 @@ struct NotificationPosition {
 /// Monitors for notification windows and repositions them
 class NotificationMonitor {
     private var observer: AXObserver?
-    private var isRunning = false
+    private var observedPID: pid_t?
     private var targetPosition: NotificationPosition
     private var scaleFactor: CGFloat
     private var showCustomNotification: Bool = false
@@ -76,37 +76,70 @@ class NotificationMonitor {
         self.customConfig = nil
     }
 
-    private var permissionTimer: Timer?
+    private var watchdogTimer: Timer?
+    private var screenObserver: NSObjectProtocol?
+    private var reportedWaitingForPermission = false
+
+    /// True while an AXObserver is attached to a live NotificationCenter process.
+    /// Monitoring can be enabled but inactive: no permission, or the agent is restarting.
+    var isActive: Bool { observer != nil }
 
     func start() {
-        if checkAccessibilityPermissions() {
-            startObserver()
-        } else {
-            print("Accessibility permissions not granted yet, will poll...")
-            startPermissionPolling()
+        _ = checkAccessibilityPermissions()
+        connectIfNeeded()
+        startWatchdog()
+
+        // Cached geometry is only valid for the screen it was measured on
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.resetPositionCache()
         }
     }
 
-    private func startPermissionPolling() {
-        permissionTimer?.invalidate()
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            if hasAccessibilityPermissions() {
-                print("Accessibility permissions granted!")
-                self?.permissionTimer?.invalidate()
-                self?.permissionTimer = nil
-                self?.startObserver()
+    /// NotificationCenter is a system agent that restarts on its own (crash, respring, login).
+    /// An AXObserver is bound to a single pid, so it goes permanently deaf when that happens.
+    /// Re-check periodically and re-attach whenever the pid changes or permission comes back.
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.connectIfNeeded()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
+    }
+
+    private func connectIfNeeded() {
+        guard hasAccessibilityPermissions() else {
+            if observer != nil {
+                print("Accessibility permission lost - detaching observer.")
+                detachObserver()
             }
-        }
-    }
-
-    private func startObserver() {
-        guard let pid = getNotificationCenterPID() else {
-            print("ERROR: Could not find NotificationCenter process")
+            // Log the wait once, not every tick
+            if !reportedWaitingForPermission {
+                print("Waiting for Accessibility permission...")
+                reportedWaitingForPermission = true
+            }
             return
         }
 
-        print("Found NotificationCenter process with PID: \(pid)")
+        guard let pid = getNotificationCenterPID() else {
+            if observer != nil {
+                print("NotificationCenter process is gone - detaching observer.")
+                detachObserver()
+            }
+            return
+        }
 
+        guard observer == nil || pid != observedPID else { return }
+
+        detachObserver()
+        attachObserver(to: pid)
+    }
+
+    private func attachObserver(to pid: pid_t) {
         // Create an observer for the NotificationCenter process
         var observerRef: AXObserver?
         let callback: AXObserverCallback = { observer, element, notification, refcon in
@@ -120,8 +153,6 @@ class NotificationMonitor {
             print("ERROR: Could not create AXObserver: \(result)")
             return
         }
-
-        self.observer = observer
 
         let app = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -144,15 +175,21 @@ class NotificationMonitor {
             }
         }
 
-        // Add observer to run loop
+        // Common modes so banners are still handled while a menu or resize loop is tracking
         CFRunLoopAddSource(
-            CFRunLoopGetCurrent(),
+            CFRunLoopGetMain(),
             AXObserverGetRunLoopSource(observer),
-            .defaultMode
+            .commonModes
         )
 
-        isRunning = true
-        print("Notification monitor started.")
+        self.observer = observer
+        self.observedPID = pid
+        reportedWaitingForPermission = false
+
+        // Geometry measured against the previous NotificationCenter instance no longer applies
+        resetPositionCache()
+
+        print("Notification monitor attached to NotificationCenter (pid \(pid)).")
         print("Target position: \(targetPosition.corner), offset: (\(targetPosition.offsetX), \(targetPosition.offsetY))")
         print("Scale factor: \(scaleFactor)")
 
@@ -160,22 +197,37 @@ class NotificationMonitor {
         repositionExistingNotifications()
     }
 
+    private func detachObserver() {
+        if let observer = observer {
+            CFRunLoopRemoveSource(
+                CFRunLoopGetMain(),
+                AXObserverGetRunLoopSource(observer),
+                .commonModes
+            )
+        }
+        observer = nil
+        observedPID = nil
+    }
+
+    private func resetPositionCache() {
+        cachedInitialPosition = nil
+        cachedInitialWindowSize = nil
+        cachedInitialNotifSize = nil
+        cachedInitialPadding = nil
+    }
+
     deinit {
         stop()
     }
 
     func stop() {
-        if let observer = observer {
-            CFRunLoopRemoveSource(
-                CFRunLoopGetCurrent(),
-                AXObserverGetRunLoopSource(observer),
-                .defaultMode
-            )
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        if let screenObserver = screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
         }
-        permissionTimer?.invalidate()
-        permissionTimer = nil
-        observer = nil
-        isRunning = false
+        detachObserver()
         print("Notification monitor stopped.")
     }
 
