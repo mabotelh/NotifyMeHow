@@ -256,6 +256,7 @@ class NotificationMonitor {
         // Find the banner container within the window
         let targetSubroles = ["AXNotificationCenterBanner", "AXNotificationCenterAlert"]
         guard let windowSize = getSize(of: window),
+              let windowOrigin = getPosition(of: window),
               let bannerContainer = findElementWithSubrole(window, targetSubroles: targetSubroles),
               let notifSize = getSize(of: bannerContainer),
               let position = getPosition(of: bannerContainer) else {
@@ -267,7 +268,12 @@ class NotificationMonitor {
         if shouldReposition {
             // Cache initial data if not already cached
             if cachedInitialPosition == nil {
-                cacheInitialNotificationData(windowSize: windowSize, notifSize: notifSize, position: position)
+                cacheInitialNotificationData(
+                    windowSize: windowSize,
+                    notifSize: notifSize,
+                    position: position,
+                    windowOrigin: windowOrigin
+                )
             }
 
             if let cachedPos = cachedInitialPosition,
@@ -352,20 +358,29 @@ class NotificationMonitor {
         return nil
     }
 
-    private func cacheInitialNotificationData(windowSize: CGSize, notifSize: CGSize, position: CGPoint) {
+    private func cacheInitialNotificationData(
+        windowSize: CGSize,
+        notifSize: CGSize,
+        position: CGPoint,
+        windowOrigin: CGPoint
+    ) {
         guard cachedInitialPosition == nil else { return }
 
         guard let screen = NSScreen.main else { return }
         let screenWidth = screen.frame.width
 
+        // Normalize into the window's own coordinate space. The banner's offset within the
+        // window does not change when the window is moved, so this stays correct even when
+        // measured while an earlier placement is still in effect. Caching the raw screen
+        // position instead makes every later placement inherit that displacement.
+        var effectivePosition = CGPoint(x: position.x - windowOrigin.x, y: position.y - windowOrigin.y)
         var padding: CGFloat
-        var effectivePosition = position
 
-        if position.x + notifSize.width > screenWidth {
+        if effectivePosition.x + notifSize.width > screenWidth {
             padding = 16.0
             effectivePosition.x = screenWidth - notifSize.width - padding
         } else {
-            let rightEdge = position.x + notifSize.width
+            let rightEdge = effectivePosition.x + notifSize.width
             padding = screenWidth - rightEdge
         }
 
