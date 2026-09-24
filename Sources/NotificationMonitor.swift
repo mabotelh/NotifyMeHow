@@ -1,5 +1,8 @@
 import ApplicationServices
 import Cocoa
+import os
+
+private let log = Logger(subsystem: "com.motleywoods.NotifyMeHow", category: "monitor")
 
 /// Mode for handling notification display
 enum NotificationMode {
@@ -78,6 +81,7 @@ class NotificationMonitor {
 
     private var watchdogTimer: Timer?
     private var screenObserver: NSObjectProtocol?
+    private var wakeObservers: [NSObjectProtocol] = []
     private var reportedWaitingForPermission = false
 
     /// True while an AXObserver is attached to a live NotificationCenter process.
@@ -96,6 +100,21 @@ class NotificationMonitor {
             queue: .main
         ) { [weak self] _ in
             self?.resetPositionCache()
+        }
+
+        // An AXObserver can go deaf across sleep/unlock while NotificationCenter keeps its pid,
+        // which the pid-based watchdog cannot detect. Re-attach unconditionally at those points.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        wakeObservers = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification
+        ].map { name in
+            workspaceCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                log.notice("\(name.rawValue, privacy: .public) - re-attaching observer.")
+                self?.detachObserver()
+                self?.connectIfNeeded()
+            }
         }
     }
 
@@ -189,7 +208,7 @@ class NotificationMonitor {
         // Geometry measured against the previous NotificationCenter instance no longer applies
         resetPositionCache()
 
-        print("Notification monitor attached to NotificationCenter (pid \(pid)).")
+        log.notice("Attached to NotificationCenter (pid \(pid, privacy: .public)).")
         print("Target position: \(targetPosition.corner), offset: (\(targetPosition.offsetX), \(targetPosition.offsetY))")
         print("Scale factor: \(scaleFactor)")
 
@@ -227,6 +246,8 @@ class NotificationMonitor {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
         }
+        wakeObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        wakeObservers = []
         detachObserver()
         print("Notification monitor stopped.")
     }
