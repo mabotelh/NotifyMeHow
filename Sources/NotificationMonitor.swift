@@ -99,6 +99,8 @@ class NotificationMonitor {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            let screens = NSScreen.screens.map { $0.frame.debugDescription }.joined(separator: ", ")
+            log.notice("Screen parameters changed - resetting position cache. Screens: \(screens, privacy: .public)")
             self?.resetPositionCache()
         }
 
@@ -133,12 +135,12 @@ class NotificationMonitor {
     private func connectIfNeeded() {
         guard hasAccessibilityPermissions() else {
             if observer != nil {
-                print("Accessibility permission lost - detaching observer.")
+                log.error("Accessibility permission lost - detaching observer.")
                 detachObserver()
             }
             // Log the wait once, not every tick
             if !reportedWaitingForPermission {
-                print("Waiting for Accessibility permission...")
+                log.notice("Waiting for Accessibility permission...")
                 reportedWaitingForPermission = true
             }
             return
@@ -146,7 +148,7 @@ class NotificationMonitor {
 
         guard let pid = getNotificationCenterPID() else {
             if observer != nil {
-                print("NotificationCenter process is gone - detaching observer.")
+                log.error("NotificationCenter process is gone - detaching observer.")
                 detachObserver()
             }
             return
@@ -169,7 +171,7 @@ class NotificationMonitor {
 
         let result = AXObserverCreate(pid, callback, &observerRef)
         guard result == .success, let observer = observerRef else {
-            print("ERROR: Could not create AXObserver: \(result)")
+            log.error("Could not create AXObserver for pid \(pid, privacy: .public): \(result.rawValue, privacy: .public)")
             return
         }
 
@@ -190,7 +192,7 @@ class NotificationMonitor {
         for notif in notifications {
             let addResult = AXObserverAddNotification(observer, app, notif as CFString, refcon)
             if addResult != .success && addResult != .notificationAlreadyRegistered {
-                print("Warning: Could not add notification \(notif): \(addResult)")
+                log.error("Could not add notification \(notif, privacy: .public): \(addResult.rawValue, privacy: .public)")
             }
         }
 
@@ -208,9 +210,11 @@ class NotificationMonitor {
         // Geometry measured against the previous NotificationCenter instance no longer applies
         resetPositionCache()
 
-        log.notice("Attached to NotificationCenter (pid \(pid, privacy: .public)).")
-        print("Target position: \(targetPosition.corner), offset: (\(targetPosition.offsetX), \(targetPosition.offsetY))")
-        print("Scale factor: \(scaleFactor)")
+        log.notice("""
+            Attached to NotificationCenter (pid \(pid, privacy: .public)). \
+            Target: \(self.targetPosition.corner.rawValue, privacy: .public) \
+            offset=(\(self.targetPosition.offsetX, privacy: .public), \(self.targetPosition.offsetY, privacy: .public))
+            """)
 
         // Also reposition any existing notification windows
         repositionExistingNotifications()
@@ -254,7 +258,7 @@ class NotificationMonitor {
 
     func setPosition(_ position: NotificationPosition) {
         targetPosition = position
-        print("Position updated to: \(position.corner)")
+        log.notice("Position updated to: \(position.corner.rawValue, privacy: .public)")
         repositionExistingNotifications()
     }
 
@@ -264,12 +268,31 @@ class NotificationMonitor {
     }
 
     private func handleNotification(element: AXUIElement, notification: String) {
+        // Diagnostics: window lifecycle and moves are low-volume; value/layout changes are too noisy to log
+        if notification == kAXWindowCreatedNotification as String ||
+           notification == kAXMovedNotification as String {
+            let origin = getPosition(of: element).map { "\($0)" } ?? "nil"
+            log.notice("\(notification, privacy: .public) role=\(getRole(of: element) ?? "nil", privacy: .public) origin=\(origin, privacy: .public)")
+        }
         // For window creation or content changes, process the notification
         if notification == kAXWindowCreatedNotification as String ||
            notification == kAXValueChangedNotification as String ||
-           notification == kAXLayoutChangedNotification as String {
-            repositionNotificationWindow(element)
+           notification == kAXLayoutChangedNotification as String,
+           let window = containingWindow(of: element) {
+            repositionNotificationWindow(window)
         }
+    }
+
+    /// Value/layout changes are delivered for elements inside the banner, not the window. Measuring or moving
+    /// those instead of their window caches the banner as its own window and yields a bogus target position.
+    private func containingWindow(of element: AXUIElement) -> AXUIElement? {
+        if getRole(of: element) == kAXWindowRole as String { return element }
+        var windowRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef) == .success,
+              let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return (windowRef as! AXUIElement)  // Safe: type ID checked above
     }
 
     /// Move notification using relative positioning on the window
@@ -283,6 +306,11 @@ class NotificationMonitor {
               let position = getPosition(of: bannerContainer) else {
             return
         }
+        log.notice("""
+            Banner found: role=\(getRole(of: window) ?? "nil", privacy: .public) \
+            window=\(windowOrigin.debugDescription, privacy: .public) \(windowSize.debugDescription, privacy: .public) \
+            banner=\(position.debugDescription, privacy: .public) \(notifSize.debugDescription, privacy: .public)
+            """)
 
         // Reposition notification (skip if topRight - the default position)
         let shouldReposition = !(targetPosition.corner == .topRight)
@@ -312,7 +340,9 @@ class NotificationMonitor {
                 // Set position directly on the window
                 var point = CGPoint(x: newPosition.x, y: newPosition.y)
                 if let value = AXValueCreate(.cgPoint, &point) {
-                    AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+                    let result = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+                    let after = getPosition(of: window).map { "\($0)" } ?? "nil"
+                    log.notice("Moved window to \(point.debugDescription, privacy: .public): result=\(result.rawValue, privacy: .public) now=\(after, privacy: .public)")
                 }
             }
         }
@@ -351,6 +381,7 @@ class NotificationMonitor {
 
     /// Move system notification off-screen to hide it
     private func hideSystemNotification(_ window: AXUIElement) {
+        log.notice("Hiding system notification (style requests it).")
         // Move window way off screen (negative coordinates)
         var point = CGPoint(x: -5000, y: -5000)
         if let value = AXValueCreate(.cgPoint, &point) {
@@ -409,6 +440,12 @@ class NotificationMonitor {
         cachedInitialWindowSize = windowSize
         cachedInitialNotifSize = notifSize
         cachedInitialPadding = padding
+        log.notice("""
+            Cached geometry: window=\(windowSize.debugDescription, privacy: .public) \
+            banner=\(notifSize.debugDescription, privacy: .public) \
+            bannerInWindow=\(effectivePosition.debugDescription, privacy: .public) padding=\(padding, privacy: .public) \
+            screen=\(screen.frame.debugDescription, privacy: .public)
+            """)
     }
 
     private func calculateRelativeOffset(
@@ -450,6 +487,7 @@ class NotificationMonitor {
     func repositionExistingNotifications() {
         // Get all NotificationCenter windows and reposition them using the same method as new notifications
         let windows = getNotificationWindows()
+        log.notice("Repositioning \(windows.count, privacy: .public) existing NotificationCenter window(s).")
         for window in windows {
             repositionNotificationWindow(window)
         }
